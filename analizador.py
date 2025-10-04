@@ -68,6 +68,9 @@ class ClimateAnalyzer:
         if self.df.empty:
             raise ValueError("No se obtuvieron datos de NASA POWER")
         
+        # CORRECCIÓN: Asegurar que 'date' sea datetime64[ns] de pandas
+        self.df['date'] = pd.to_datetime(self.df['date'])
+        
         print(f"✓ Descarga completa: {len(self.df)} registros")
     
     def get_historical_window(self, target_date: str, window_days: int = 7) -> pd.DataFrame:
@@ -248,46 +251,46 @@ class ClimateAnalyzer:
 def print_results(probs: Dict, prediction: Dict, ml_results: Optional[Dict] = None) -> None:
     """Imprime resultados en formato legible"""
     print("\n" + "="*60)
-    print(f"ANÁLISIS CLIMÁTICO PARA {prediction['target_date']}")
+    print(f"ANALISIS CLIMATICO PARA {prediction['target_date']}")
     print("="*60)
     
-    print(f"\n📊 Datos Históricos:")
-    print(f"   • Muestras: {probs['n_samples']} días de {probs['n_years']} años diferentes")
-    print(f"   • Rango: {probs['date_range'][0]} a {probs['date_range'][1]}")
+    print(f"\nDatos Historicos:")
+    print(f"   * Muestras: {probs['n_samples']} dias de {probs['n_years']} años diferentes")
+    print(f"   * Rango: {probs['date_range'][0]} a {probs['date_range'][1]}")
     
     if 'rain_probability' in probs:
-        print(f"\n🌧️  Precipitación:")
-        print(f"   • Probabilidad de lluvia: {probs['rain_probability']*100:.1f}%")
-        print(f"   • Promedio cuando llueve: {probs['avg_precip']:.1f} mm")
-        print(f"   • Máximo histórico: {probs['max_precip']:.1f} mm")
+        print(f"\nPrecipitacion:")
+        print(f"   * Probabilidad de lluvia: {probs['rain_probability']*100:.1f}%")
+        print(f"   * Promedio cuando llueve: {probs['avg_precip']:.1f} mm")
+        print(f"   * Maximo historico: {probs['max_precip']:.1f} mm")
     
     if 'avg_temp' in probs:
-        print(f"\n🌡️  Temperatura:")
-        print(f"   • Promedio: {probs['avg_temp']:.1f}°C (±{probs['temp_std']:.1f}°C)")
-        print(f"   • Rango: {probs['temp_range'][0]:.1f}°C a {probs['temp_range'][1]:.1f}°C")
-        print(f"   • Probabilidad día caluroso (>30°C): {probs['hot_day_probability']*100:.1f}%")
-        print(f"   • Probabilidad día frío (<10°C): {probs['cold_day_probability']*100:.1f}%")
+        print(f"\nTemperatura:")
+        print(f"   * Promedio: {probs['avg_temp']:.1f}°C (±{probs['temp_std']:.1f}°C)")
+        print(f"   * Rango: {probs['temp_range'][0]:.1f}°C a {probs['temp_range'][1]:.1f}°C")
+        print(f"   * Probabilidad dia caluroso (>30°C): {probs['hot_day_probability']*100:.1f}%")
+        print(f"   * Probabilidad dia frio (<10°C): {probs['cold_day_probability']*100:.1f}%")
     
     if 'avg_humidity' in probs:
-        print(f"\n💧 Humedad:")
-        print(f"   • Promedio: {probs['avg_humidity']:.1f}%")
-        print(f"   • Probabilidad alta humedad (>80%): {probs['high_humidity_prob']*100:.1f}%")
+        print(f"\nHumedad:")
+        print(f"   * Promedio: {probs['avg_humidity']:.1f}%")
+        print(f"   * Probabilidad alta humedad (>80%): {probs['high_humidity_prob']*100:.1f}%")
     
     if 'avg_wind' in probs:
-        print(f"\n💨 Viento:")
-        print(f"   • Velocidad promedio: {probs['avg_wind']:.1f} m/s")
-        print(f"   • Probabilidad viento fuerte (>7 m/s): {probs['strong_wind_prob']*100:.1f}%")
+        print(f"\nViento:")
+        print(f"   * Velocidad promedio: {probs['avg_wind']:.1f} m/s")
+        print(f"   * Probabilidad viento fuerte (>7 m/s): {probs['strong_wind_prob']*100:.1f}%")
     
     if ml_results:
-        print(f"\n🤖 Modelos Machine Learning:")
+        print(f"\nModelos Machine Learning:")
         metrics = ml_results['metrics']
-        print(f"   • Logistic Regression: {metrics['logreg_acc']*100:.1f}% acc, AUC={metrics['logreg_auc']:.3f}")
-        print(f"   • Random Forest: {metrics['rf_acc']*100:.1f}% acc, AUC={metrics['rf_auc']:.3f}")
+        print(f"   * Logistic Regression: {metrics['logreg_acc']*100:.1f}% acc, AUC={metrics['logreg_auc']:.3f}")
+        print(f"   * Random Forest: {metrics['rf_acc']*100:.1f}% acc, AUC={metrics['rf_auc']:.3f}")
         
         if prediction['method'] == 'ml_ensemble':
-            print(f"\n🎯 Predicción Ensamble (ML):")
-            print(f"   • Probabilidad de lluvia: {prediction['ensemble_prob']*100:.1f}%")
-            print(f"   • Decisión: {'⛈️  LLOVERÁ' if prediction['ensemble_prob'] > 0.5 else '☀️  NO LLOVERÁ'}")
+            print(f"\nPrediccion Ensamble (ML):")
+            print(f"   * Probabilidad de lluvia: {prediction['ensemble_prob']*100:.1f}%")
+            print(f"   * Decision: {'LLOVERA' if prediction['ensemble_prob'] > 0.5 else 'NO LLOVERA'}")
     
     print("\n" + "="*60)
 
@@ -383,6 +386,8 @@ Ejemplos:
         
     except Exception as e:
         print(f"\n❌ Error: {e}", file=sys.stderr)
+        import traceback
+        traceback.print_exc()
         sys.exit(1)
 
 
