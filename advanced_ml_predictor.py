@@ -193,7 +193,7 @@ class AdvancedClimatePredictor:
             m_std = d.groupby("month")[c].transform("std")
             d[f"{c}_anom"] = (d[c] - m_mean) / (m_std + 1e-5)
 
-        return d
+        return d.copy()
 
     # ------------------- SPLIT -------------------
     @staticmethod
