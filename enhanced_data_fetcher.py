@@ -1,480 +1,492 @@
-"""
-enhanced_data_fetcher.py
-
-Módulo mejorado para integrar múltiples fuentes de datos de NASA
-"""
-import requests
-import pandas as pd
-import numpy as np
-from datetime import datetime, timedelta
+# enhanced_data_fetcher.py
+# ------------------------------------------------------------
+# Ingesta multi-fuente robusta para AtmosAtlas:
+#  - NASA POWER (REST)           -> precip, t2m, rh2m, wind, rad, ps (diario, 1981-presente)
+#  - GPM IMERG V07 (OPeNDAP)     -> precip (diario, 2000-06-presente) [opcional]
+#  - GPCP 1DD (OPeNDAP, NOAA PSL)-> precip (diario, 1996-10-presente) [opcional]
+#  - GPCP Monthly (OPeNDAP, NOAA)-> precip (mensual, 1979-01-presente) [opcional, reamostrado a diario]
+#
+# Fusión con pesos por variable y estimación de incertidumbre inter-fuentes.
+# Devuelve además un "provenance" completo por fuente y variable.
+# Degrada elegantemente a POWER-only si no hay credenciales/red/paquetes.
+# ------------------------------------------------------------
+from __future__ import annotations
+from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
-import xarray as xr
-from pydap.client import open_url
-from pydap.cas.urs import setup_session
-import earthaccess
-import json
-from concurrent.futures import ThreadPoolExecutor, as_completed
-import time
+from datetime import datetime, date
+import os
 
-class EnhancedDataFetcher:
-    """Integración de múltiples fuentes de datos NASA para análisis climático robusto"""
-    
-    def __init__(self, credentials: Optional[Dict] = None):
-        """
-        Args:
-            credentials: Dict con credenciales NASA Earthdata
-                {'username': 'user', 'password': 'pass'}
-        """
-        self.credentials = credentials
-        self.sources = {
-            'power': PowerDataSource(),
-            'giovanni': GiovanniDataSource(),
-            'gpm': GPMDataSource(),
-            'opendap': OPeNDAPDataSource(),
-            'modis': MODISDataSource()
-        }
-        
-        # Setup Earthdata login si hay credenciales
-        if credentials:
-            earthaccess.login(
-                strategy="netrc",
-                persist=True
-            )
-    
-    def fetch_ensemble_data(self, lat: float, lon: float, 
-                           start_date: str, end_date: str,
-                           sources: List[str] = None) -> pd.DataFrame:
-        """
-        Obtiene datos de múltiples fuentes y los combina en un DataFrame ensemble
-        
-        Args:
-            lat: Latitud
-            lon: Longitud  
-            start_date: Fecha inicio (YYYY-MM-DD)
-            end_date: Fecha fin (YYYY-MM-DD)
-            sources: Lista de fuentes a usar (default: todas)
-            
-        Returns:
-            DataFrame con datos combinados de múltiples fuentes
-        """
-        if sources is None:
-            sources = list(self.sources.keys())
-        
-        # Fetch paralelo de múltiples fuentes
-        with ThreadPoolExecutor(max_workers=len(sources)) as executor:
-            futures = {}
-            for source_name in sources:
-                if source_name in self.sources:
-                    future = executor.submit(
-                        self.sources[source_name].fetch,
-                        lat, lon, start_date, end_date
-                    )
-                    futures[future] = source_name
-            
-            results = {}
-            for future in as_completed(futures):
-                source_name = futures[future]
-                try:
-                    data = future.result(timeout=30)
-                    results[source_name] = data
-                    print(f"✓ {source_name}: {len(data)} registros obtenidos")
-                except Exception as e:
-                    print(f"✗ {source_name}: Error - {e}")
-                    results[source_name] = pd.DataFrame()
-        
-        # Combinar resultados
-        return self._merge_sources(results)
-    
-    def _merge_sources(self, results: Dict[str, pd.DataFrame]) -> pd.DataFrame:
-        """
-        Combina datos de múltiples fuentes usando técnicas de ensemble
-        """
-        # Crear DataFrame base con fechas
-        start = pd.to_datetime(list(results.values())[0]['date'].min())
-        end = pd.to_datetime(list(results.values())[0]['date'].max())
-        date_range = pd.date_range(start, end, freq='D')
-        
-        merged = pd.DataFrame({'date': date_range})
-        
-        # Variables a combinar con pesos por fuente
-        variable_weights = {
-            'precip': {
-                'gpm': 0.4,      # GPM es más preciso para precipitación
-                'power': 0.3,
-                'giovanni': 0.2,
-                'modis': 0.1
-            },
-            'temp': {
-                'modis': 0.35,    # MODIS es mejor para temperatura
-                'power': 0.35,
-                'giovanni': 0.2,
-                'opendap': 0.1
-            },
-            'humidity': {
-                'power': 0.4,
-                'giovanni': 0.3,
-                'modis': 0.2,
-                'opendap': 0.1
-            }
-        }
-        
-        # Combinar cada variable usando weighted average
-        for var, weights in variable_weights.items():
-            var_data = []
-            var_weights_used = []
-            
-            for source_name, df in results.items():
-                if not df.empty and var in df.columns:
-                    # Merge con fecha
-                    temp = pd.merge(
-                        merged[['date']], 
-                        df[['date', var]], 
-                        on='date', 
-                        how='left',
-                        suffixes=('', f'_{source_name}')
-                    )
-                    
-                    if var in temp.columns:
-                        var_data.append(temp[var].values)
-                        var_weights_used.append(weights.get(source_name, 0.1))
-            
-            # Calcular weighted average
-            if var_data:
-                var_array = np.array(var_data)
-                weights_array = np.array(var_weights_used)
-                weights_array = weights_array / weights_array.sum()
-                
-                # Weighted nanmean
-                merged[var] = np.average(
-                    var_array,
-                    axis=0,
-                    weights=weights_array[:, None]
-                )
-                
-                # Calcular incertidumbre (std entre fuentes)
-                merged[f'{var}_uncertainty'] = np.nanstd(var_array, axis=0)
-        
-        return merged
+import numpy as np
+import pandas as pd
+import requests
+
+# Cache HTTP para POWER (mejora robustez y evita rate limiting)
+try:
+    import requests_cache  # type: ignore
+    requests_cache.install_cache("power_cache", expire_after=6 * 3600)
+except Exception:
+    pass
+
+# OPeNDAP/Earthdata (opcional)
+try:
+    import xarray as xr  # type: ignore
+    HAS_XARRAY = True
+except Exception:
+    HAS_XARRAY = False
+
+try:
+    import earthaccess  # type: ignore
+    HAS_EARTHACCESS = True
+except Exception:
+    HAS_EARTHACCESS = False
 
 
+# ----------------- Cobertura temporal por fuente -----------------
+EARLIEST = {
+    "power": "1981-01-01",      # POWER daily API (doc oficial)
+    "imerg": "2000-06-01",      # IMERG V07 (TRMM/GPM)
+    "gpcp_daily": "1996-10-01", # GPCP 1DD
+    "gpcp_monthly": "1979-01-01" # GPCP Monthly
+}
+
+TODAY_STR = date.today().strftime("%Y-%m-%d")
+
+
+# ----------------- Fuentes -----------------
 class PowerDataSource:
-    """Fuente de datos NASA POWER (ya implementado)"""
-    
+    """NASA POWER: REST JSON diario (comunidad AG)."""
+    BASE = "https://power.larc.nasa.gov/api/temporal/daily/point"
+    # Variables núcleo (nombres POWER -> nombres normalizados)
+    PARAMS = "PRECTOTCORR,T2M,RH2M,WS10M,ALLSKY_SFC_SW_DWN,PS"
+    RENAME = {
+        "PRECTOTCORR": "precip",            # mm/day
+        "T2M": "t2m",                        # °C
+        "RH2M": "rh2m",                      # %
+        "WS10M": "wind",                     # m/s
+        "ALLSKY_SFC_SW_DWN": "rad",         # kWh/m^2/day
+        "PS": "ps"                           # kPa
+    }
+
     def fetch(self, lat: float, lon: float, start: str, end: str) -> pd.DataFrame:
-        """Fetch desde NASA POWER API"""
-        base_url = "https://power.larc.nasa.gov/api/temporal/daily/point"
         params = {
             "start": start.replace("-", ""),
             "end": end.replace("-", ""),
-            "latitude": lat,
-            "longitude": lon,
+            "latitude": float(lat),
+            "longitude": float(lon),
             "community": "AG",
-            "parameters": "PRECTOTCORR,T2M,RH2M,WS10M,ALLSKY_SFC_SW_DWN,PS",
-            "format": "JSON"
+            "parameters": self.PARAMS,
+            "format": "JSON",
         }
-        
-        try:
-            response = requests.get(base_url, params=params, timeout=30)
-            response.raise_for_status()
-            data = response.json()
-            
-            # Convertir a DataFrame
-            props = data.get("properties", {})
-            param_data = props.get("parameter", {})
-            
-            dates = []
-            records = []
-            
-            for date_str in param_data.get("PRECTOTCORR", {}).keys():
-                date = datetime.strptime(date_str, "%Y%m%d")
-                dates.append(date)
-                
-                record = {
-                    'date': date,
-                    'precip': param_data.get("PRECTOTCORR", {}).get(date_str),
-                    'temp': param_data.get("T2M", {}).get(date_str),
-                    'humidity': param_data.get("RH2M", {}).get(date_str),
-                    'wind': param_data.get("WS10M", {}).get(date_str),
-                    'radiation': param_data.get("ALLSKY_SFC_SW_DWN", {}).get(date_str),
-                    'pressure': param_data.get("PS", {}).get(date_str)
-                }
-                records.append(record)
-            
-            return pd.DataFrame(records)
-        
-        except Exception as e:
-            print(f"Error en POWER: {e}")
-            return pd.DataFrame()
+        r = requests.get(self.BASE, params=params, timeout=60)
+        r.raise_for_status()
+        data = r.json()
+        block = data.get("properties", {}).get("parameter", {})
+        if not block:
+            return pd.DataFrame(columns=["date"] + list(self.RENAME.values()))
 
+        # fechas presentes en la respuesta
+        dates = sorted(set().union(*(set(v.keys()) for v in block.values())))
+        rows = []
+        for dstr in dates:
+            dt = datetime.strptime(dstr, "%Y%m%d")
+            row = {"date": dt}
+            for k_power, k_std in self.RENAME.items():
+                row[k_std] = block.get(k_power, {}).get(dstr, None)
+            rows.append(row)
 
-class GPMDataSource:
-    """Fuente de datos GPM (Global Precipitation Measurement)"""
-    
-    def __init__(self):
-        self.base_url = "https://gpm1.gesdisc.eosdis.nasa.gov/opendap/GPM_L3"
-        
-    def fetch(self, lat: float, lon: float, start: str, end: str) -> pd.DataFrame:
-        """Fetch GPM IMERG precipitation data"""
-        try:
-            # GPM IMERG Late Run (más preciso)
-            product = "GPM_3IMERGDL.06"
-            
-            start_dt = datetime.strptime(start, "%Y-%m-%d")
-            end_dt = datetime.strptime(end, "%Y-%m-%d")
-            
-            records = []
-            current = start_dt
-            
-            while current <= end_dt:
-                # Construir URL para el día
-                year = current.year
-                month = current.month
-                day = current.day
-                doy = current.timetuple().tm_yday
-                
-                url = (f"{self.base_url}/{product}/{year}/{doy:03d}/"
-                      f"3B-DAY-L.MS.MRG.3IMERG.{current.strftime('%Y%m%d')}"
-                      f"-S000000-E235959.V06.nc4")
-                
-                try:
-                    # Intentar obtener datos del día
-                    # Aquí usarías OPeNDAP para subset espacial
-                    precip_value = self._fetch_point_from_opendap(url, lat, lon)
-                    
-                    records.append({
-                        'date': current,
-                        'precip': precip_value,
-                        'precip_source': 'GPM_IMERG'
-                    })
-                except:
-                    pass  # Día sin datos
-                
-                current += timedelta(days=1)
-            
-            return pd.DataFrame(records)
-            
-        except Exception as e:
-            print(f"Error en GPM: {e}")
-            return pd.DataFrame()
-    
-    def _fetch_point_from_opendap(self, url: str, lat: float, lon: float) -> float:
-        """Extrae valor de un punto desde OPeNDAP"""
-        # Simulación - en producción usarías pydap
-        # con autenticación NASA Earthdata
-        return np.random.uniform(0, 10)  # mm/día
-
-
-class GiovanniDataSource:
-    """Fuente de datos NASA Giovanni"""
-    
-    def fetch(self, lat: float, lon: float, start: str, end: str) -> pd.DataFrame:
-        """
-        Fetch desde Giovanni usando su API REST
-        Giovanni provee acceso a múltiples datasets procesados
-        """
-        try:
-            # Giovanni requiere registro y API key
-            # Aquí simulamos la estructura de datos que retornaría
-            
-            # En producción usarías:
-            # 1. Autenticación OAuth2 con NASA Earthdata
-            # 2. Solicitud de job a Giovanni
-            # 3. Polling hasta completarse
-            # 4. Download de resultados
-            
-            dates = pd.date_range(start, end, freq='D')
-            data = []
-            
-            for date in dates:
-                # Simular datos de múltiples productos Giovanni
-                data.append({
-                    'date': date,
-                    'precip': np.random.uniform(0, 15),      # TRMM/GPM merged
-                    'temp': np.random.uniform(15, 35),        # MODIS LST
-                    'humidity': np.random.uniform(40, 90),    # AIRS
-                    'cloud_fraction': np.random.uniform(0, 1) # MODIS Cloud
-                })
-            
-            return pd.DataFrame(data)
-            
-        except Exception as e:
-            print(f"Error en Giovanni: {e}")
-            return pd.DataFrame()
-
-
-class OPeNDAPDataSource:
-    """
-    Acceso directo a datasets via OPeNDAP
-    Permite subset espacial/temporal eficiente sin descargar archivos completos
-    """
-    
-    def __init__(self):
-        self.servers = {
-            'gesdisc': 'https://disc2.gesdisc.eosdis.nasa.gov/opendap',
-            'podaac': 'https://opendap.jpl.nasa.gov/opendap',
-            'laads': 'https://ladsweb.modaps.eosdis.nasa.gov/opendap'
-        }
-    
-    def fetch(self, lat: float, lon: float, start: str, end: str) -> pd.DataFrame:
-        """Fetch desde múltiples servidores OPeNDAP"""
-        try:
-            # Ejemplo: MERRA-2 reanalysis data
-            dataset = self._fetch_merra2(lat, lon, start, end)
-            return dataset
-            
-        except Exception as e:
-            print(f"Error en OPeNDAP: {e}")
-            return pd.DataFrame()
-    
-    def _fetch_merra2(self, lat: float, lon: float, start: str, end: str) -> pd.DataFrame:
-        """
-        Fetch MERRA-2 reanalysis data
-        MERRA-2 provee datos horarios de alta resolución
-        """
-        # En producción:
-        # 1. Setup sesión con credenciales NASA Earthdata
-        # 2. Abrir dataset con pydap
-        # 3. Subset por lat/lon/tiempo
-        # 4. Agregar a diario
-        
-        dates = pd.date_range(start, end, freq='D')
-        data = []
-        
-        for date in dates:
-            data.append({
-                'date': date,
-                'temp': np.random.uniform(15, 35),
-                'temp_min': np.random.uniform(10, 20),
-                'temp_max': np.random.uniform(25, 40),
-                'humidity': np.random.uniform(40, 90),
-                'pressure': np.random.uniform(980, 1030),
-                'wind_u': np.random.uniform(-5, 5),
-                'wind_v': np.random.uniform(-5, 5)
-            })
-        
-        df = pd.DataFrame(data)
-        df['wind'] = np.sqrt(df['wind_u']**2 + df['wind_v']**2)
-        
+        df = pd.DataFrame(rows).sort_values("date").reset_index(drop=True)
+        for c in ["precip", "t2m", "rh2m", "wind", "rad", "ps"]:
+            if c in df.columns:
+                df[c] = pd.to_numeric(df[c], errors="coerce")
         return df
 
 
-class MODISDataSource:
+class IMERGDataSource:
     """
-    Datos MODIS de temperatura superficial y vegetación
-    Útil para microclimas y condiciones locales
+    IMERG V07 Daily (Final/Late). Acceso vía Earthdata + OPeNDAP con xarray.
+    Si no hay dependencias/credenciales, retorna DF vacío.
     """
-    
+    # Nota: para un solo punto, accedemos a cada "granule" y extraemos la grilla más próxima.
+    # Este método es seguro pero puede ser lento; se usa sólo si la instalación lo permite.
+    SHORT_NAME = "GPM_3IMERGDF"  # L3 Final Daily
+
     def fetch(self, lat: float, lon: float, start: str, end: str) -> pd.DataFrame:
-        """Fetch MODIS Land Surface Temperature y otros productos"""
+        if not (HAS_XARRAY and HAS_EARTHACCESS):
+            return pd.DataFrame(columns=["date", "precip"])
         try:
-            # MODIS provee datos cada 8 días
-            # Interpolaremos para obtener serie diaria
-            
-            dates = pd.date_range(start, end, freq='8D')
-            data = []
-            
-            for date in dates:
-                data.append({
-                    'date': date,
-                    'lst_day': np.random.uniform(20, 40),    # Land Surface Temp día
-                    'lst_night': np.random.uniform(10, 25),  # Land Surface Temp noche
-                    'ndvi': np.random.uniform(0.2, 0.8),     # Índice vegetación
-                    'evi': np.random.uniform(0.1, 0.6)       # Enhanced Vegetation Index
-                })
-            
-            df = pd.DataFrame(data)
-            
-            # Interpolar a diario
-            df = df.set_index('date').resample('D').interpolate(method='cubic')
-            df['temp'] = (df['lst_day'] + df['lst_night']) / 2
-            
-            return df.reset_index()
-            
-        except Exception as e:
-            print(f"Error en MODIS: {e}")
+            earthaccess.login()  # .netrc / variables de entorno
+        except Exception:
+            # sin login, degradar en silencio
+            return pd.DataFrame(columns=["date", "precip"])
+
+        try:
+            results = earthaccess.search_data(short_name=self.SHORT_NAME, temporal=(start, end))
+            if not results:
+                return pd.DataFrame(columns=["date", "precip"])
+
+            rows: List[Dict] = []
+            for gran in results:
+                urls = gran.data_links(access="opendap")
+                if not urls:
+                    continue
+                url = urls[0]
+                ds = xr.open_dataset(url)
+                # nombres típicos
+                var = "precipitation" if "precipitation" in ds.data_vars else list(ds.data_vars)[0]
+                # índice del píxel más cercano
+                i_lat = int(np.abs(ds["lat"].values - lat).argmin())
+                i_lon = int(np.abs(ds["lon"].values - lon).argmin())
+                ts = ds[var][:, i_lat, i_lon].to_series()  # mm/day
+                ts.index = pd.to_datetime(ts.index)
+                for t, v in ts.items():
+                    rows.append({"date": pd.to_datetime(t).to_pydatetime(), "precip": float(v)})
+                ds.close()
+
+            if not rows:
+                return pd.DataFrame(columns=["date", "precip"])
+            out = pd.DataFrame(rows).groupby("date", as_index=False)["precip"].mean()
+            return out.sort_values("date").reset_index(drop=True)
+        except Exception:
+            return pd.DataFrame(columns=["date", "precip"])
+
+
+class GPCPDailyDataSource:
+    """
+    GPCP 1DD diario (1996-10 en adelante). OPeNDAP NOAA PSL.
+    Este endpoint suele estar disponible sin credenciales.
+    """
+    # Dataset agregado típico (puede cambiar; por eso hay try/except y fallback silencioso):
+    # https://psl.noaa.gov/thredds/dodsC/Datasets/gpcp/1DD/gpcp_v01dd_199610-present.nc
+    # Como nombre "var": 'precip'
+    CANDIDATE_URLS = [
+        "https://psl.noaa.gov/thredds/dodsC/Datasets/gpcp/1DD/precip.1996-present.nc",
+        "https://psl.noaa.gov/thredds/dodsC/Datasets/gpcp/1DD/gpcp_v01dd_199610-present.nc",
+    ]
+    VAR = "precip"
+
+    def fetch(self, lat: float, lon: float, start: str, end: str) -> pd.DataFrame:
+        if not HAS_XARRAY:
+            return pd.DataFrame(columns=["date", "precip"])
+        for url in self.CANDIDATE_URLS:
+            try:
+                ds = xr.open_dataset(url)
+                # recorte temporal
+                ds_sel = ds.sel(time=slice(start, end))
+                # punto más cercano
+                i_lat = int(np.abs(ds_sel["lat"].values - lat).argmin())
+                i_lon = int(np.abs(ds_sel["lon"].values - lon).argmin())
+                ts = ds_sel[self.VAR][:, i_lat, i_lon].to_series()
+                ts.index = pd.to_datetime(ts.index)
+                df = ts.reset_index()
+                df.columns = ["date", "precip"]  # mm/day
+                ds.close()
+                return df.sort_values("date").reset_index(drop=True)
+            except Exception:
+                continue
+        return pd.DataFrame(columns=["date", "precip"])
+
+
+class GPCPMonthlyDataSource:
+    """
+    GPCP Mensual (1979-01 en adelante). NOAA PSL OPeNDAP.
+    Reamostramos a diario rellenando con el promedio diario del mes (mm/day).
+    """
+    URL = "https://psl.noaa.gov/thredds/dodsC/Datasets/gpcp/precip.mon.mean.nc"
+    VAR = "precip"
+
+    def fetch(self, lat: float, lon: float, start: str, end: str) -> pd.DataFrame:
+        if not HAS_XARRAY:
+            return pd.DataFrame(columns=["date", "precip"])
+        try:
+            ds = xr.open_dataset(self.URL)
+            ds_sel = ds.sel(time=slice(start, end))
+            i_lat = int(np.abs(ds_sel["lat"].values - lat).argmin())
+            i_lon = int(np.abs(ds_sel["lon"].values - lon).argmin())
+            ts = ds_sel[self.VAR][:, i_lat, i_lon].to_series()  # unidades: mm/day (promedio mensual)
+            ts.index = pd.to_datetime(ts.index).to_period("M").to_timestamp("M")  # fin de mes
+            # expandir a diario: repetimos el valor medio diario del mes en todos los días de ese mes
+            daily_rows: List[Dict] = []
+            for month_end, v in ts.items():
+                if pd.isna(v):
+                    continue
+                # rango de ese mes
+                m_start = (pd.to_datetime(month_end) - pd.offsets.MonthEnd(1)) + pd.offsets.Day(1)
+                m_end = pd.to_datetime(month_end)
+                dates = pd.date_range(m_start, m_end, freq="D")
+                for d in dates:
+                    daily_rows.append({"date": d.to_pydatetime(), "precip": float(v)})
+            ds.close()
+            if not daily_rows:
+                return pd.DataFrame(columns=["date", "precip"])
+            return pd.DataFrame(daily_rows).sort_values("date").reset_index(drop=True)
+        except Exception:
+            return pd.DataFrame(columns=["date", "precip"])
+
+
+# ----------------- Pesos por variable -----------------
+@dataclass
+class EnsembleWeights:
+    precip: Dict[str, float] = None
+    t2m: Dict[str, float] = None
+    rh2m: Dict[str, float] = None
+    wind: Dict[str, float] = None
+    rad: Dict[str, float] = None
+    ps: Dict[str, float] = None
+
+    def __post_init__(self):
+        # Precisión típica: IMERG > GPCP > POWER para precipitación
+        # Nota: cuando no exista IMERG/GPCP, el peso efectivo recae en POWER
+        self.precip = self.precip or {
+            "imerg": 0.55,        # si disponible
+            "gpcp_daily": 0.30,   # si disponible
+            "gpcp_monthly": 0.15, # si disponible (proxy mensual)
+            "power": 0.35         # respaldo continuo
+        }
+        # El resto proviene esencialmente de POWER en este flujo
+        self.t2m  = self.t2m  or {"power": 1.0}
+        self.rh2m = self.rh2m or {"power": 1.0}
+        self.wind = self.wind or {"power": 1.0}
+        self.rad  = self.rad  or {"power": 1.0}
+        self.ps   = self.ps   or {"power": 1.0}
+
+
+# ----------------- FUSIONADOR PRINCIPAL -----------------
+class EnhancedDataFetcher:
+    """
+    Ingesta multi-fuente con:
+      - Auto-ajuste al inicio MÁS ANTIGUO posible por fuente (puede ignorar "start" del usuario).
+      - Fusión ponderada por variable + incertidumbre inter-fuentes.
+      - "Provenance" por fuente/variable (rango temporal usado, nº de registros, fracción de aporte).
+    """
+
+    def __init__(self, verbose: bool = False):
+        self.verbose = verbose
+        self.sources = {
+            "power": PowerDataSource(),
+            "imerg": IMERGDataSource(),
+            "gpcp_daily": GPCPDailyDataSource(),
+            "gpcp_monthly": GPCPMonthlyDataSource(),
+        }
+        self.weights = EnsembleWeights()
+        self.last_provenance: Dict = {}
+
+    # ---------- UTILIDADES ----------
+    @staticmethod
+    def _clip_to_source_range(source: str, start: str, end: str) -> Tuple[str, str]:
+        s0 = pd.to_datetime(EARLIEST.get(source, start))
+        s1 = pd.to_datetime(start)
+        e1 = pd.to_datetime(end)
+        s_final = min(s0, s1)  # usar lo más antiguo disponible (puede ignorar el start del usuario)
+        return s_final.strftime("%Y-%m-%d"), e1.strftime("%Y-%m-%d")
+
+    @staticmethod
+    def _normalize_df(df: pd.DataFrame) -> pd.DataFrame:
+        if df is None or df.empty:
+            return pd.DataFrame()
+        out = df.copy()
+        out["date"] = pd.to_datetime(out["date"]).dt.tz_localize(None)
+        out = out.sort_values("date").reset_index(drop=True)
+        # evitar infinitos
+        for c in [x for x in out.columns if x != "date"]:
+            out[c] = pd.to_numeric(out[c], errors="coerce")
+            out.loc[~np.isfinite(out[c]), c] = np.nan
+        return out
+
+    # ---------- DESCARGA EN CONJUNTO ----------
+    def fetch_ensemble_data(
+        self,
+        lat: float, lon: float,
+        start: str, end: str,
+        sources: Optional[List[str]] = None,
+        auto_earliest: bool = True
+    ) -> pd.DataFrame:
+        srcs = sources or list(self.sources.keys())
+        results: Dict[str, pd.DataFrame] = {}
+        self.last_provenance = {
+            "request": {"lat": lat, "lon": lon, "target_start": start, "target_end": end, "auto_earliest": auto_earliest},
+            "sources": {},
+            "variables": {}
+        }
+
+        for name in srcs:
+            try:
+                s_use, e_use = (self._clip_to_source_range(name, start, end) if auto_earliest
+                                else (start, end))
+                df = self.sources[name].fetch(lat, lon, s_use, e_use)
+                df = self._normalize_df(df)
+                results[name] = df
+
+                nrec = int(len(df)) if not df.empty else 0
+                smin = df["date"].min().strftime("%Y-%m-%d") if nrec else None
+                smax = df["date"].max().strftime("%Y-%m-%d") if nrec else None
+                self.last_provenance["sources"][name] = {
+                    "attempted_range": [s_use, e_use],
+                    "actual_range": [smin, smax],
+                    "records": nrec
+                }
+                if self.verbose:
+                    print(f"✓ {name}: registros={nrec} rango={smin}..{smax}")
+            except Exception as e:
+                if self.verbose:
+                    print(f"✗ {name}: {e}")
+                results[name] = pd.DataFrame()
+                self.last_provenance["sources"][name] = {
+                    "attempted_range": [start, end],
+                    "actual_range": [None, None],
+                    "records": 0,
+                    "error": str(e)
+                }
+
+        merged = self._merge_sources(results)
+        # completar metadatos de variables
+        self._finalize_variable_contributions(merged, results)
+        return merged
+
+    # ---------- FUSIÓN ----------
+    def _merge_sources(self, results: Dict[str, pd.DataFrame]) -> pd.DataFrame:
+        # calendario maestro = unión de todas las fechas disponibles
+        all_dates = pd.Index([])
+        for df in results.values():
+            if df is not None and not df.empty and "date" in df.columns:
+                all_dates = all_dates.union(pd.to_datetime(df["date"]).dt.normalize().unique())
+        if len(all_dates) == 0:
             return pd.DataFrame()
 
+        merged = pd.DataFrame({"date": pd.to_datetime(sorted(all_dates))})
 
-class DataQualityAnalyzer:
-    """
-    Analiza la calidad de datos de múltiples fuentes
-    y proporciona métricas de confiabilidad
-    """
-    
-    @staticmethod
-    def assess_quality(df: pd.DataFrame) -> Dict:
-        """
-        Evalúa calidad de los datos
-        
-        Returns:
-            Dict con métricas de calidad
-        """
-        metrics = {
-            'completeness': {},
-            'consistency': {},
-            'reliability': {}
+        # Variables a fusionar (precip y meteo)
+        variable_maps = {
+            "precip": self.weights.precip,
+            "t2m": self.weights.t2m,
+            "rh2m": self.weights.rh2m,
+            "wind": self.weights.wind,
+            "rad": self.weights.rad,
+            "ps": self.weights.ps
         }
-        
-        # Completeness: % de datos no-nulos
-        for col in df.columns:
-            if col != 'date':
-                metrics['completeness'][col] = df[col].notna().mean()
-        
-        # Consistency: correlación entre fuentes (si hay columnas _uncertainty)
-        uncertainty_cols = [c for c in df.columns if '_uncertainty' in c]
-        if uncertainty_cols:
-            metrics['consistency']['avg_uncertainty'] = df[uncertainty_cols].mean().mean()
-            metrics['consistency']['max_uncertainty'] = df[uncertainty_cols].max().max()
-        
-        # Reliability score (0-1)
-        avg_completeness = np.mean(list(metrics['completeness'].values()))
-        avg_consistency = 1 - metrics['consistency'].get('avg_uncertainty', 0) / 10
-        metrics['reliability']['overall_score'] = (avg_completeness + avg_consistency) / 2
-        
-        # Recomendaciones
-        metrics['recommendations'] = []
-        if avg_completeness < 0.8:
-            metrics['recommendations'].append("Considerar ampliar ventana temporal para más datos")
-        if metrics['consistency'].get('avg_uncertainty', 0) > 5:
-            metrics['recommendations'].append("Alta incertidumbre entre fuentes - verificar manualmente")
-        
+
+        for var, wmap in variable_maps.items():
+            series_list, src_names, weights = [], [], []
+            for src, df in results.items():
+                if df is not None and not df.empty and var in df.columns:
+                    aligned = pd.merge(merged[["date"]], df[["date", var]], on="date", how="left")[var].values
+                    series_list.append(aligned)
+                    src_names.append(src)
+                    weights.append(wmap.get(src, 0.0))
+            if not series_list:
+                continue
+
+            arr = np.array(series_list, dtype="float64")
+            w = np.array(weights, dtype="float64")
+            # si todos los pesos son 0 (p.ej. var no soportada por esa fuente), usar promedio simple
+            if np.nansum(w) > 0:
+                w = w / np.nansum(w)
+                fused = np.nansum(arr * w[:, None], axis=0)
+            else:
+                fused = np.nanmean(arr, axis=0)
+
+            merged[var] = fused
+            merged[f"{var}_uncertainty"] = np.nanstd(arr, axis=0)
+
+        return merged
+
+    # ---------- PROVENANCE / CONTRIBUCIONES ----------
+    def _finalize_variable_contributions(self, merged: pd.DataFrame, results: Dict[str, pd.DataFrame]) -> None:
+        # Por variable: fracción de puntos aportados por cada fuente (no nulos)
+        variables = ["precip", "t2m", "rh2m", "wind", "rad", "ps"]
+        contrib: Dict[str, Dict[str, float]] = {}
+        for var in variables:
+            total_non_nan = 0
+            src_non_nan: Dict[str, int] = {}
+            for src, df in results.items():
+                if df is not None and not df.empty and var in df.columns:
+                    aligned = pd.merge(merged[["date"]], df[["date", var]], on="date", how="left")[var]
+                    nnz = int(aligned.notna().sum())
+                    total_non_nan += nnz
+                    src_non_nan[src] = nnz
+            if total_non_nan == 0:
+                continue
+            contrib[var] = {src: round(n / total_non_nan, 4) for src, n in src_non_nan.items()}
+
+        # Rango global del dataset resultante
+        if merged is not None and not merged.empty:
+            gmin = merged["date"].min().strftime("%Y-%m-%d")
+            gmax = merged["date"].max().strftime("%Y-%m-%d")
+        else:
+            gmin = gmax = None
+
+        self.last_provenance["variables"] = {
+            "contributions_fraction": contrib,
+            "global_range": [gmin, gmax]
+        }
+
+    # ---------- Resumen legible ----------
+    def provenance_summary(self) -> str:
+        """Crea una frase compacta del tipo:
+        POWER (1981–2025), IMERG (2000–2025), GPCP(1979–2025)
+        Sólo cita fuentes que realmente aportaron datos (records>0)."""
+        srcs = self.last_provenance.get("sources", {})
+        parts = []
+        name_map = {
+            "power": "POWER",
+            "imerg": "IMERG",
+            "gpcp_daily": "GPCP-1DD",
+            "gpcp_monthly": "GPCP-Monthly"
+        }
+        for k in ["power", "imerg", "gpcp_daily", "gpcp_monthly"]:
+            info = srcs.get(k, {})
+            if info and info.get("records", 0) > 0:
+                r = info.get("actual_range") or [None, None]
+                s = (r[0] or "").split("-")[0]
+                e = (r[1] or "").split("-")[0]
+                if s and e:
+                    parts.append(f"{name_map[k]} ({s}–{e})")
+        # Rango global
+        gr = self.last_provenance.get("variables", {}).get("global_range", [None, None])
+        gtxt = ""
+        if gr[0] and gr[1]:
+            gtxt = f" | Rango combinado: {gr[0]} → {gr[1]}"
+        return ("; ".join(parts) + gtxt).strip()
+
+
+# ----------------- Calidad de datos -----------------
+class DataQualityAnalyzer:
+    """Métricas básicas de calidad/consistencia + provenance integrado."""
+    @staticmethod
+    def assess(df: pd.DataFrame, provenance: Optional[Dict] = None) -> Dict:
+        metrics = {"completeness": {}, "consistency": {}, "reliability": {}, "provenance": provenance or {}}
+        if df is None or df.empty:
+            return metrics
+
+        # completitud por columna (sin incertidumbres)
+        for c in [c for c in df.columns if c != "date" and not c.endswith("_uncertainty")]:
+            metrics["completeness"][c] = float(df[c].notna().mean())
+
+        # incertidumbre media inter-fuente
+        ucols = [c for c in df.columns if c.endswith("_uncertainty")]
+        if ucols:
+            metrics["consistency"]["avg_uncertainty"] = float(df[ucols].mean().mean())
+
+        # fiabilidad simple: combina completitud + consistencia
+        avg_comp = np.mean(list(metrics["completeness"].values())) if metrics["completeness"] else 0.0
+        avg_cons = 1.0 - (metrics["consistency"].get("avg_uncertainty", 0.0) / 10.0)
+        metrics["reliability"]["overall_score"] = float(max(0.0, min(1.0, 0.5 * (avg_comp + avg_cons))))
+
+        # rango temporal global
+        metrics["time_coverage"] = {
+            "start": df["date"].min().strftime("%Y-%m-%d"),
+            "end": df["date"].max().strftime("%Y-%m-%d"),
+            "n_days": int(len(df))
+        }
+
+        # resumen legible
+        if provenance and "sources" in provenance:
+            parts = []
+            for src, info in provenance["sources"].items():
+                if info.get("records", 0) > 0:
+                    r = info.get("actual_range") or [None, None]
+                    parts.append(f"{src}: {r[0]}→{r[1]} ({info.get('records')} registros)")
+            metrics["provenance_summary"] = " | ".join(parts)
+        else:
+            metrics["provenance_summary"] = ""
+
         return metrics
-
-
-# Ejemplo de uso
-if __name__ == "__main__":
-    # Inicializar fetcher con credenciales (opcional)
-    fetcher = EnhancedDataFetcher()
-    
-    # Obtener datos ensemble
-    lat, lon = 20.676667, -103.347222
-    start = "2024-01-01"
-    end = "2024-12-31"
-    
-    print(f"Obteniendo datos para ({lat}, {lon}) desde {start} hasta {end}")
-    print("="*60)
-    
-    # Fetch de múltiples fuentes
-    ensemble_data = fetcher.fetch_ensemble_data(
-        lat, lon, start, end,
-        sources=['power', 'giovanni', 'gpm', 'modis']
-    )
-    
-    print(f"\n✓ Datos ensemble obtenidos: {len(ensemble_data)} días")
-    print(f"✓ Columnas disponibles: {list(ensemble_data.columns)}")
-    
-    # Analizar calidad
-    quality = DataQualityAnalyzer.assess_quality(ensemble_data)
-    print(f"\n📊 Análisis de Calidad:")
-    print(f"   - Score de confiabilidad: {quality['reliability']['overall_score']:.2%}")
-    print(f"   - Completitud promedio: {np.mean(list(quality['completeness'].values())):.2%}")
-    
-    if quality['recommendations']:
-        print("\n⚠️ Recomendaciones:")
-        for rec in quality['recommendations']:
-            print(f"   - {rec}")
-    
-    # Guardar resultados
-    output_file = f"ensemble_data_{lat}_{lon}_{start}_{end}.csv"
-    ensemble_data.to_csv(output_file, index=False)
-    print(f"\n💾 Datos guardados en: {output_file}")
