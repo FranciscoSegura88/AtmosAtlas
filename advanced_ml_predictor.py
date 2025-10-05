@@ -17,6 +17,7 @@ import numpy as np
 import pandas as pd
 import warnings
 import logging
+from pandas.errors import PerformanceWarning
 
 from sklearn.preprocessing import StandardScaler, RobustScaler
 from sklearn.ensemble import (
