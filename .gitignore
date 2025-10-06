@@ -1,0 +1,25 @@
+# Entorno virtual
+.venv/
+venv/
+
+# Archivos temporales de Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Archivos de configuración local
+.env
+power_cache.sqlite
+*.log
+
+# Datos o modelos generados
+models/
+*_cache/
+*.h5
+*.pkl
+*.sav
+
+# Archivos del sistema
+.DS_Store
+Thumbs.db
