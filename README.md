@@ -1,29 +1,30 @@
 # 🌦️ AtmosAtlas
 
-**AtmosAtlas** analiza clima histórico (NASA POWER y opcionalmente IMERG/GPCP) para estimar la **probabilidad de lluvia** y otras variables en una **fecha futura** (climatología + ML básico + ML avanzado calibrado).  
-> **No** es pronóstico meteorológico en tiempo real; es **riesgo basado en historia** para decisiones informadas.
+**AtmosAtlas** analyzes historical weather (NASA POWER and optionally IMERG/GPCP) to estimate the **probability of rain** and other variables on a **future date** (climatology + basic ML + calibrated advanced ML).  
+> It is **not** a real-time forecast; it provides **history-based risk** to support informed decisions.
 
 ---
 
-## 🧭 Arquitectura (resumen)
-- **Datos**:  
-  - `POWER` diario (precip, t2m, rh2m, wind, rad, ps).  
-  - `IMERG` V07 diario (precip) *opcional* vía **Earthdata** (OPeNDAP ó descarga HTTPS) — requiere token.  
-  - `GPCP Daily/Monthly` *opcional* como respaldo.
-- **Ingesta y fusión**: `enhanced_data_fetcher.py` con “provenance” y pesos por variable + incertidumbre inter‑fuente.
-- **Análisis**:  
-  - Estadístico (frecuencias históricas).  
-  - ML básico (LR + RF).  
-  - **ML avanzado** (regresión mm + clasificación) con anti‑fragmentación y calibración mm→prob.
-- **Orquestación + explicabilidad**: `analizador_integrado.py`.
-- **API**: FastAPI (`main_api_actualizado.py`) con respuesta extendida y narrativa de explicabilidad.
+## 🧭 Architecture (summary)
+- **Data**
+  - Daily `POWER` (precipitation, T2M, RH2M, wind, radiation, surface pressure).
+  - Optional `IMERG` V07 daily (precip) via **Earthdata** (OPeNDAP/HTTPS) — token required.
+  - Optional `GPCP` Daily/Monthly as fallback.
+- **Ingestion & fusion:** `enhanced_data_fetcher.py` with data provenance, per-variable weighting, and inter-source uncertainty.
+- **Analysis:**
+  - Statistical (historical frequencies).
+  - Basic ML (Logistic Regression + Random Forest).
+  - **Advanced ML** (mm regression + classification) with anti-fragmentation and mm→probability calibration.
+- **Orchestration & explainability:** `analizador_integrado.py`.
+- **API:** FastAPI (`main_api_actualizado.py`) with extended response and an explainability narrative.
 
 ---
 
-## ⚙️ Requisitos
-- Python 3.10+ (recomendado 3.11+)
+## ⚙️ Requirements
+- Python 3.10+ (3.11+ recommended)
 - Windows/macOS/Linux
-- Internet (POWER). Para IMERG/GPCP se recomienda: `xarray`, `netCDF4`, `h5netcdf`, `pydap`, `earthaccess`.
+- Internet access (POWER). For IMERG/GPCP it’s recommended to install: `xarray`, `netCDF4`, `h5netcdf`, `pydap`, `earthaccess`.
 
 ```bash
 pip install -r requirements.txt
+
